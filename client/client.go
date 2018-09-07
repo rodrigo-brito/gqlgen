@@ -74,28 +74,9 @@ func (p *Client) mkRequest(query string, options ...Option) Request {
 }
 
 func (p *Client) Post(query string, response interface{}, options ...Option) (resperr error) {
-	r := p.mkRequest(query, options...)
-	requestBody, err := json.Marshal(r)
-	if err != nil {
-		return fmt.Errorf("encode: %s", err.Error())
-	}
-
-	rawResponse, err := p.client.Post(p.url, "application/json", bytes.NewBuffer(requestBody))
-	if err != nil {
-		return fmt.Errorf("post: %s", err.Error())
-	}
-	defer func() {
-		_ = rawResponse.Body.Close()
-	}()
-
-	if rawResponse.StatusCode >= http.StatusBadRequest {
-		responseBody, _ := ioutil.ReadAll(rawResponse.Body)
-		return fmt.Errorf("http %d: %s", rawResponse.StatusCode, responseBody)
-	}
-
-	responseBody, err := ioutil.ReadAll(rawResponse.Body)
-	if err != nil {
-		return fmt.Errorf("read: %s", err.Error())
+	responseBody, resperr := p.RawPost(query, options...)
+	if resperr != nil {
+		return resperr
 	}
 
 	// decode it into map string first, let mapstructure do the final decode
@@ -104,7 +85,7 @@ func (p *Client) Post(query string, response interface{}, options ...Option) (re
 		Data   interface{}
 		Errors json.RawMessage
 	}{}
-	err = json.Unmarshal(responseBody, &respDataRaw)
+	err := json.Unmarshal(responseBody, &respDataRaw)
 	if err != nil {
 		return fmt.Errorf("decode: %s", err.Error())
 	}
@@ -116,6 +97,33 @@ func (p *Client) Post(query string, response interface{}, options ...Option) (re
 		return RawJsonError{respDataRaw.Errors}
 	}
 	return unpackErr
+}
+
+func (p *Client) RawPost(query string, options ...Option) ([]byte, error) {
+	r := p.mkRequest(query, options...)
+	requestBody, err := json.Marshal(r)
+	if err != nil {
+		return nil, fmt.Errorf("encode: %s", err.Error())
+	}
+
+	rawResponse, err := p.client.Post(p.url, "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("post: %s", err.Error())
+	}
+	defer func() {
+		_ = rawResponse.Body.Close()
+	}()
+
+	if rawResponse.StatusCode >= http.StatusBadRequest {
+		responseBody, _ := ioutil.ReadAll(rawResponse.Body)
+		return nil, fmt.Errorf("http %d: %s", rawResponse.StatusCode, responseBody)
+	}
+
+	responseBody, err := ioutil.ReadAll(rawResponse.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read: %s", err.Error())
+	}
+	return responseBody, nil
 }
 
 type RawJsonError struct {

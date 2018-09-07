@@ -5,10 +5,13 @@ package testserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
+
+	"github.com/99designs/gqlgen/graphql"
 
 	"github.com/99designs/gqlgen/client"
 	"github.com/99designs/gqlgen/handler"
@@ -78,6 +81,32 @@ func TestGeneratedServer(t *testing.T) {
 			require.Equal(t, "Ok", resp.Valid)
 		})
 	})
+}
+
+func TestResponseExtension(t *testing.T) {
+	srv := httptest.NewServer(handler.GraphQL(
+		NewExecutableSchema(Config{
+			Resolvers: &testResolver{},
+		}),
+		handler.RequestMiddleware(func(ctx context.Context, next func(ctx context.Context) []byte) []byte {
+			rctx := graphql.GetRequestContext(ctx)
+			if err := rctx.RegisterExtension("example", "value"); err != nil {
+				panic(err)
+			}
+			return next(ctx)
+		}),
+	))
+	c := client.New(srv.URL)
+
+	raw, _ := c.RawPost(`query { valid }`)
+	res := struct {
+		Extensions struct {
+			Example string
+		}
+	}{}
+	err := json.Unmarshal(raw, &res)
+	require.Nil(t, err)
+	require.Equal(t, res.Extensions.Example, "value")
 }
 
 type testResolver struct{}
