@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/y0ssar1an/q"
 	"io"
 	"net/http"
 	"strings"
@@ -16,6 +18,13 @@ import (
 	"github.com/vektah/gqlparser/ast"
 	"github.com/vektah/gqlparser/gqlerror"
 	"github.com/vektah/gqlparser/validator"
+)
+
+var (
+	ErrOperationNotFound    = errors.New("operation not found")
+	ErrUnsupportedOperation = errors.New("unsupported operation type")
+	ErrQueryLimitExceed     = errors.New("unsupported operation type")
+	ErrCacheCreation = errors.New("cache creation failed")
 )
 
 type params struct {
@@ -34,7 +43,9 @@ type Config struct {
 	complexityLimit int
 }
 
-func (c *Config) newRequestContext(doc *ast.QueryDocument, query string, variables map[string]interface{}) *graphql.RequestContext {
+func (c *Config) newRequestContext(doc *ast.QueryDocument, query string,
+	variables map[string]interface{}) *graphql.RequestContext {
+
 	reqCtx := graphql.NewRequestContext(doc, query, variables)
 	if hook := c.recover; hook != nil {
 		reqCtx.Recover = hook
@@ -56,6 +67,12 @@ func (c *Config) newRequestContext(doc *ast.QueryDocument, query string, variabl
 }
 
 type Option func(cfg *Config)
+
+func WithConfig(newCfg *Config) Option {
+	return func(cfg *Config) {
+		cfg = newCfg
+	}
+}
 
 func WebsocketUpgrader(upgrader websocket.Upgrader) Option {
 	return func(cfg *Config) {
@@ -132,17 +149,12 @@ func CacheSize(size int) Option {
 
 const DefaultCacheSize = 1000
 
-func GraphQL(exec graphql.ExecutableSchema, options ...Option) http.HandlerFunc {
-	cfg := Config{
-		cacheSize: DefaultCacheSize,
-		upgrader: websocket.Upgrader{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-		},
-	}
+func Exec(ctx context.Context, exec graphql.ExecutableSchema, query, operation string,
+	variables map[string]interface{}, options ...Option) (response *graphql.Response, err error) {
 
+	cfg := new(Config)
 	for _, option := range options {
-		option(&cfg)
+		option(cfg)
 	}
 
 	var cache *lru.Cache
@@ -150,10 +162,72 @@ func GraphQL(exec graphql.ExecutableSchema, options ...Option) http.HandlerFunc 
 		var err error
 		cache, err = lru.New(DefaultCacheSize)
 		if err != nil {
-			// An error is only returned for non-positive cache size
-			// and we already checked for that.
-			panic("unexpected error creating cache: " + err.Error())
+			return nil, ErrCacheCreation
 		}
+	}
+
+	var doc *ast.QueryDocument
+	if cache != nil {
+		val, ok := cache.Get(query)
+		if ok {
+			doc = val.(*ast.QueryDocument)
+		}
+	}
+
+	if doc == nil {
+		var qErr gqlerror.List
+		doc, qErr = gqlparser.LoadQuery(exec.Schema(), query)
+		if len(qErr) > 0 {
+			return nil, qErr
+		}
+		if cache != nil {
+			cache.Add(query, doc)
+		}
+	}
+
+	op := doc.Operations.ForName(operation)
+	if op == nil {
+		return nil, ErrOperationNotFound
+	}
+
+	vars, err := validator.VariableValues(exec.Schema(), op, variables)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx := graphql.NewRequestContext(doc, query, vars)
+	ctx = graphql.WithRequestContext(ctx, reqCtx)
+
+	defer func() {
+		if panicErr := recover(); panicErr != nil {
+			err = reqCtx.Recover(ctx, panicErr)
+		}
+	}()
+
+	if cfg.complexityLimit > 0 {
+		queryComplexity := complexity.Calculate(exec, op, vars)
+		if queryComplexity > cfg.complexityLimit {
+			return nil, ErrQueryLimitExceed
+		}
+	}
+
+	switch op.Operation {
+	case ast.Query:
+		return exec.Query(ctx, op), nil
+	case ast.Mutation:
+		return exec.Mutation(ctx, op), nil
+	default:
+		return nil, ErrUnsupportedOperation
+	}
+}
+
+func GraphQL(exec graphql.ExecutableSchema, options ...Option) http.HandlerFunc {
+	cfg := Config{
+		cacheSize: DefaultCacheSize,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+		},
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -189,77 +263,36 @@ func GraphQL(exec graphql.ExecutableSchema, options ...Option) http.HandlerFunc 
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
 
-		var doc *ast.QueryDocument
-		if cache != nil {
-			val, ok := cache.Get(reqParams.Query)
-			if ok {
-				doc = val.(*ast.QueryDocument)
-			}
-		}
-		if doc == nil {
-			var qErr gqlerror.List
-			doc, qErr = gqlparser.LoadQuery(exec.Schema(), reqParams.Query)
-			if len(qErr) > 0 {
-				sendError(w, http.StatusUnprocessableEntity, qErr...)
-				return
-			}
-			if cache != nil {
-				cache.Add(reqParams.Query, doc)
-			}
-		}
+		options = append(options, WithConfig(&cfg))
 
-		op := doc.Operations.ForName(reqParams.OperationName)
-		if op == nil {
-			sendErrorf(w, http.StatusUnprocessableEntity, "operation %s not found", reqParams.OperationName)
-			return
-		}
-
-		if op.Operation != ast.Query && r.Method == http.MethodGet {
-			sendErrorf(w, http.StatusUnprocessableEntity, "GET requests only allow query operations")
-			return
-		}
-
-		vars, err := validator.VariableValues(exec.Schema(), op, reqParams.Variables)
+		response, err := Exec(r.Context(), exec, reqParams.Query, reqParams.OperationName, reqParams.Variables, options...)
 		if err != nil {
-			sendError(w, http.StatusUnprocessableEntity, err)
-			return
-		}
-		reqCtx := cfg.newRequestContext(doc, reqParams.Query, vars)
-		ctx := graphql.WithRequestContext(r.Context(), reqCtx)
-
-		defer func() {
-			if err := recover(); err != nil {
-				userErr := reqCtx.Recover(ctx, err)
-				sendErrorf(w, http.StatusUnprocessableEntity, userErr.Error())
-			}
-		}()
-
-		if cfg.complexityLimit > 0 {
-			queryComplexity := complexity.Calculate(exec, op, vars)
-			if queryComplexity > cfg.complexityLimit {
-				sendErrorf(w, http.StatusUnprocessableEntity, "query has complexity %d, which exceeds the limit of %d", queryComplexity, cfg.complexityLimit)
+			if err, ok := err.(gqlerror.List); ok && len(err) > 0 {
+				sendError(w, http.StatusUnprocessableEntity, err...)
 				return
 			}
+
+			switch err {
+			case ErrUnsupportedOperation:
+				sendErrorf(w, http.StatusBadRequest, "unsupported operation type")
+			case ErrOperationNotFound:
+				sendErrorf(w, http.StatusUnprocessableEntity, "operation not found")
+			default :
+				sendError(w, http.StatusUnprocessableEntity)
+			}
+			return
 		}
 
-		switch op.Operation {
-		case ast.Query:
-			b, err := json.Marshal(exec.Query(ctx, op))
-			if err != nil {
-				panic(err)
-			}
-			w.Write(b)
-		case ast.Mutation:
-			b, err := json.Marshal(exec.Mutation(ctx, op))
-			if err != nil {
-				panic(err)
-			}
-			w.Write(b)
-		default:
-			sendErrorf(w, http.StatusBadRequest, "unsupported operation type")
+		q.Q(response)
+
+		b, err := json.Marshal(response)
+		if err != nil {
+			w.WriteHeader(http.StatusUnprocessableEntity)
 		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(b)
 	})
 }
 
